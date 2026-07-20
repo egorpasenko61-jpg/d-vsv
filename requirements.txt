@@ -1,2 +1,2 @@
 telethon
-aiogram
+aiogram>=3.0 telethon aiohttp aiosqlite
