@@ -66,8 +66,6 @@ async def load_config(user_id: int) -> dict:
         with open(file_path, "r", encoding="utf-8") as f:
             data = json.load(f)
             
-            # УБРАНО: Принудительный премиум для ADMIN_ID стерт. Теперь ты обычный юзер.
-                
             # Проверка и сброс дневного лимита при наступлении нового дня
             today = datetime.now().strftime("%Y-%m-%d")
             if data.get("last_sent_date") != today:
@@ -81,9 +79,9 @@ async def save_config(user_id: int, config_data: dict):
         with open(file_path, "w", encoding="utf-8") as f:
             json.dump(config_data, f, ensure_ascii=False, indent=4)
 
-# Взаимодействие с CryptoBot API
+# Взаимодействие с CryptoBot API (Исправленный официальный URL)
 async def create_crypto_invoice(amount: float, user_id: int):
-    url = "https://pay.crypton.me/api/createInvoice"
+    url = "https://pay.cryptobot.net/api/createInvoice"
     headers = {"Crypto-Pay-API-Token": CRYPTO_BOT_TOKEN}
     payload = {
         "asset": "USDT",
@@ -100,12 +98,14 @@ async def create_crypto_invoice(amount: float, user_id: int):
                     res_json = await resp.json()
                     if res_json.get("ok"):
                         return res_json["result"]["pay_url"], res_json["result"]["invoice_id"]
+                else:
+                    print(f"CryptoBot API вернул статус {resp.status}: {await resp.text()}")
     except Exception as e:
         print(f"Ошибка создания счета CryptoBot: {e}")
     return None, None
 
 async def check_crypto_invoice(invoice_id: int):
-    url = f"https://pay.crypton.me/api/getInvoices?invoice_ids={invoice_id}"
+    url = f"https://pay.cryptobot.net/api/getInvoices?invoice_ids={invoice_id}"
     headers = {"Crypto-Pay-API-Token": CRYPTO_BOT_TOKEN}
     try:
         async with aiohttp.ClientSession() as session:
@@ -254,7 +254,7 @@ async def cb_buy_premium(callback: CallbackQuery):
         
     pay_url, invoice_id = await create_crypto_invoice(SUB_PRICE_USD, user_id)
     if not pay_url:
-        await callback.answer("❌ Ошибка платежной системы. Попробуйте позже.", show_alert=True)
+        await callback.answer("❌ Ошибка платежной системы. Проверьте настройки приложения в Crypto Pay.", show_alert=True)
         return
         
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -281,7 +281,6 @@ async def cb_check_pay(callback: CallbackQuery, bot: Bot):
                                         "Лимиты сняты, водный знак отключен.", 
                                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📥 В меню", callback_data="back_to_menu")]]))
         
-        # УВЕДОМЛЕНИЕ ДЛЯ АДМИНА О ПОКУПКЕ
         try:
             username = f"@{callback.from_user.username}" if callback.from_user.username else "Нет юзернейма"
             await bot.send_message(
