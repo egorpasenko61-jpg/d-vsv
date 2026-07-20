@@ -22,7 +22,7 @@ BOT_TOKEN = "7860968550:AAHNx_mJHsDrohp0DV60eTy1wCdl8gKxqmE"
 CRYPTO_BOT_TOKEN = "611722:AARQbBBi1uLtIjPPcr9fwNl24y0SVbroSZG" 
 
 # Настройки SaaS
-ADMIN_ID = 7521801228
+ADMIN_ID = 7521801228  # Сюда будут приходить уведомления о покупках
 FREE_LIMIT = 50
 SUB_PRICE_USD = 1.5
 WATERMARK = "\n\nОтправлено с помощью @nonewin_bot"
@@ -66,9 +66,7 @@ async def load_config(user_id: int) -> dict:
         with open(file_path, "r", encoding="utf-8") as f:
             data = json.load(f)
             
-            # Принудительная вечная подписка для админа
-            if user_id == ADMIN_ID:
-                data["is_premium"] = True
+            # УБРАНО: Принудительный премиум для ADMIN_ID стерт. Теперь ты обычный юзер.
                 
             # Проверка и сброс дневного лимита при наступлении нового дня
             today = datetime.now().strftime("%Y-%m-%d")
@@ -270,7 +268,7 @@ async def cb_buy_premium(callback: CallbackQuery):
                                     "Нажмите кнопку ниже для перехода к оплате:", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("check_pay_"))
-async def cb_check_pay(callback: CallbackQuery):
+async def cb_check_pay(callback: CallbackQuery, bot: Bot):
     user_id = callback.from_user.id
     invoice_id = int(callback.data.replace("check_pay_", ""))
     is_paid = await check_crypto_invoice(invoice_id)
@@ -282,6 +280,20 @@ async def cb_check_pay(callback: CallbackQuery):
         await callback.message.edit_text("🎉 **Поздравляем! Премиум успешно активирован!**\n"
                                         "Лимиты сняты, водный знак отключен.", 
                                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📥 В меню", callback_data="back_to_menu")]]))
+        
+        # УВЕДОМЛЕНИЕ ДЛЯ АДМИНА О ПОКУПКЕ
+        try:
+            username = f"@{callback.from_user.username}" if callback.from_user.username else "Нет юзернейма"
+            await bot.send_message(
+                chat_id=ADMIN_ID,
+                text=f"💰 **Новая покупка подписки!**\n\n"
+                     f"• Пользователь: {callback.from_user.full_name}\n"
+                     f"• Юзернейм: {username}\n"
+                     f"• ID: `{user_id}`\n"
+                     f"• Сумма: {SUB_PRICE_USD}$ через CryptoBot"
+            )
+        except Exception as e:
+            print(f"Не удалось отправить уведомление админу: {e}")
     else:
         await callback.answer("❌ Оплата не найдена. Сначала оплатите счет в CryptoBot!", show_alert=True)
 
