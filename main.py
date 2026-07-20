@@ -81,7 +81,6 @@ async def init_telethon_accounts_for_user(user_id: int):
             print(f"❌ Ошибка загрузки сессии {session_name} для {user_id}: {e}")
 
 async def init_all_existing_accounts():
-    """Находит все конфиги и инициализирует сессии при перезапуске бота"""
     for file in os.listdir("."):
         if file.startswith("config_") and file.endswith(".json"):
             try:
@@ -91,7 +90,6 @@ async def init_all_existing_accounts():
                 continue
 
 async def mailing_worker_for_user(user_id: int):
-    """Отдельный воркер рассылки для каждого конкретного пользователя"""
     while True:
         config = await load_config(user_id)
         user_clients = telethon_accounts.get(user_id, {})
@@ -131,11 +129,9 @@ async def mailing_worker_for_user(user_id: int):
                     delay = random.randint(config["delays"]["min"], config["delays"]["max"])
                     await asyncio.sleep(delay)
         else:
-            # Если рассылка остановлена пользователем, завершаем данный воркер
             break
         await asyncio.sleep(3)
 
-# Активные воркеры { user_id: task }
 active_workers = {}
 
 def start_user_worker(user_id: int):
@@ -218,6 +214,15 @@ async def cb_stop(callback: CallbackQuery):
     await callback.message.edit_reply_markup(reply_markup=get_main_keyboard(config["status"]))
     await callback.answer("⏹ Рассылка остановлена.", show_alert=False)
 
+@dp.callback_query(F.data == "reset_status")
+async def cb_reset_status(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    config = await load_config(user_id)
+    config["status"] = "stopped"
+    await save_config(user_id, config)
+    await callback.message.edit_reply_markup(reply_markup=get_main_keyboard(config["status"]))
+    await callback.answer("🔄 Статус успешно сброшен на 'Остановлено'.", show_alert=True)
+
 @dp.callback_query(F.data == "deep_clean")
 async def cb_deep_clean(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -298,6 +303,43 @@ async def process_chats_list(message: Message, state: FSMContext):
     await message.answer(f"✅ Всего: {len(config['chats'])} чатов загружено.", reply_markup=get_main_keyboard(config["status"]))
     await state.clear()
 
+@dp.callback_query(F.data == "set_delay")
+async def cb_set_delay(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(BotStates.waiting_for_delay_min)
+    await callback.message.answer("⏱ Введите **минимальную** задержку в секундах (целое число):")
+
+@dp.message(BotStates.waiting_for_delay_min)
+async def process_delay_min(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("❌ Пожалуйста, введите корректное число:")
+        return
+    await state.update_data(min_delay=int(message.text))
+    await state.set_state(BotStates.waiting_for_delay_max)
+    await message.answer("⏱ Введите **максимальную** задержку в секундах (целое число):")
+
+@dp.message(BotStates.waiting_for_delay_max)
+async def process_delay_max(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("❌ Пожалуйста, введите корректное число:")
+        return
+    user_id = message.from_user.id
+    data = await state.get_data()
+    min_delay = data.get("min_delay")
+    max_delay = int(message.text)
+    
+    if min_delay > max_delay:
+        await message.answer("❌ Минимальная задержка не может быть больше максимальной! Начните настройку сначала кнопкой из меню.")
+        await state.clear()
+        return
+
+    config = await load_config(user_id)
+    config["delays"]["min"] = min_delay
+    config["delays"]["max"] = max_delay
+    await save_config(user_id, config)
+    
+    await message.answer(f"✅ Задержки успешно обновлены: **{min_delay}-{max_delay} сек.**", reply_markup=get_main_keyboard(config["status"]))
+    await state.clear()
+
 @dp.callback_query(F.data == "accounts_manage")
 async def cb_accounts_manage(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -324,7 +366,6 @@ async def process_phone(message: Message, state: FSMContext):
     phone = message.text.strip().replace(" ", "")
     config = await load_config(user_id)
     
-    # Имя файла сессии теперь содержит ID пользователя, чтобы не пересекаться с чужими сессиями
     new_session = f"session_{user_id}_{len(config.get('session_names', [])) + 1}"
     client = TelegramClient(new_session, API_ID, API_HASH)
     await client.connect()
@@ -392,7 +433,11 @@ async def process_password(message: Message, state: FSMContext):
 async def cb_stats_view(callback: CallbackQuery):
     user_id = callback.from_user.id
     config = await load_config(user_id)
-    text = f"📊 **Ваша статистика:**\n\nОтправлено сообщений: {config['stats']['sent_count']}"
+    text = (f"📊 **Ваша статистика:**\n\n"
+            f"• Отправлено сообщений: {config['stats']['sent_count']}\n"
+            f"• Текущая задержка: {config['delays']['min']}-{config['delays']['max']} сек.\n"
+            f"• Загружено чатов: {len(config['chats'])}\n"
+            f"• Активных аккаунтов: {len(config.get('session_names', []))}")
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅ Назад", callback_data="back_to_menu")]])
     await callback.message.edit_text(text, reply_markup=kb)
 
@@ -401,7 +446,6 @@ async def main():
     print("Инициализация существующих аккаунтов пользователей...")
     await init_all_existing_accounts()
     
-    # Запускаем воркеры для всех пользователей, у которых статус был "started"
     for user_id in telethon_accounts.keys():
         config = await load_config(user_id)
         if config.get("status") == "started":
