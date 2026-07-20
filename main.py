@@ -79,9 +79,9 @@ async def save_config(user_id: int, config_data: dict):
         with open(file_path, "w", encoding="utf-8") as f:
             json.dump(config_data, f, ensure_ascii=False, indent=4)
 
-# Взаимодействие с CryptoBot API (Исправленный официальный URL)
+# Взаимодействие с CryptoBot API (Официальный URL: https://pay.crypt.bot/api/)
 async def create_crypto_invoice(amount: float, user_id: int):
-    url = "https://pay.cryptobot.net/api/createInvoice"
+    url = "https://pay.crypt.bot/api/createInvoice"
     headers = {"Crypto-Pay-API-Token": CRYPTO_BOT_TOKEN}
     payload = {
         "asset": "USDT",
@@ -94,18 +94,33 @@ async def create_crypto_invoice(amount: float, user_id: int):
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload, headers=headers) as resp:
+                body = await resp.text()
                 if resp.status == 200:
-                    res_json = await resp.json()
+                    res_json = await resp.json() if body else {}
                     if res_json.get("ok"):
-                        return res_json["result"]["pay_url"], res_json["result"]["invoice_id"]
+                        return res_json["result"]["pay_url"], res_json["result"]["invoice_id"], None
+                    else:
+                        # API ответил 200, но ok=false — покажем причину
+                        err = res_json.get("error", {})
+                        msg = f"API ok=false: name={err.get('name')}, code={err.get('code')}"
+                        print(f"[CryptoPay] {msg}")
+                        return None, None, msg
                 else:
-                    print(f"CryptoBot API вернул статус {resp.status}: {await resp.text()}")
+                    err_msg = f"HTTP {resp.status}: {body[:300]}"
+                    print(f"[CryptoPay] {err_msg}")
+                    return None, None, err_msg
+    except aiohttp.ClientConnectorError as e:
+        err_msg = f"Нет соединения с pay.crypt.bot: {e}"
+        print(f"[CryptoPay] {err_msg}")
+        return None, None, err_msg
     except Exception as e:
-        print(f"Ошибка создания счета CryptoBot: {e}")
-    return None, None
+        err_msg = f"Исключение при создании счета: {e}"
+        print(f"[CryptoPay] {err_msg}")
+        return None, None, err_msg
+    return None, None, "Неизвестная ошибка"
 
 async def check_crypto_invoice(invoice_id: int):
-    url = f"https://pay.cryptobot.net/api/getInvoices?invoice_ids={invoice_id}"
+    url = f"https://pay.crypt.bot/api/getInvoices?invoice_ids={invoice_id}"
     headers = {"Crypto-Pay-API-Token": CRYPTO_BOT_TOKEN}
     try:
         async with aiohttp.ClientSession() as session:
@@ -114,8 +129,13 @@ async def check_crypto_invoice(invoice_id: int):
                     res_json = await resp.json()
                     if res_json.get("ok") and res_json["result"]["items"]:
                         return res_json["result"]["items"][0]["status"] == "paid"
+                    else:
+                        err = res_json.get("error", {})
+                        print(f"[CryptoPay] getInvoices ok=false: {err}")
+                else:
+                    print(f"[CryptoPay] getInvoices HTTP {resp.status}: {await resp.text()}")
     except Exception as e:
-        print(f"Ошибка проверки счета CryptoBot: {e}")
+        print(f"[CryptoPay] Ошибка проверки счета: {e}")
     return False
 
 async def init_telethon_accounts_for_user(user_id: int):
@@ -252,9 +272,11 @@ async def cb_buy_premium(callback: CallbackQuery):
         await callback.answer("⭐ У вас уже есть Премиум!", show_alert=True)
         return
         
-    pay_url, invoice_id = await create_crypto_invoice(SUB_PRICE_USD, user_id)
+    pay_url, invoice_id, err = await create_crypto_invoice(SUB_PRICE_USD, user_id)
     if not pay_url:
-        await callback.answer("❌ Ошибка платежной системы. Проверьте настройки приложения в Crypto Pay.", show_alert=True)
+        # Покажем конкретную причину — пригодится для дебага
+        detail = f"\n\nПричина: {err}" if err else ""
+        await callback.answer(f"❌ Ошибка платежной системы. Проверьте настройки приложения в Crypto Pay.{detail}", show_alert=True)
         return
         
     kb = InlineKeyboardMarkup(inline_keyboard=[
