@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import random
+from datetime import datetime
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
@@ -9,16 +10,23 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from telethon import TelegramClient
-from telethon.tl.functions.messages import GetDialogsRequest
-from telethon.tl.types import InputPeerEmpty, Chat, Channel
-from telethon.errors import FloodWaitError, UserPrivacyRestrictedError, ChatWriteForbiddenError, SessionPasswordNeededError
+from telethon.errors import FloodWaitError, SessionPasswordNeededError
+import aiohttp
 
-# Глобальные настройки API (для всех одинаковые)
+# Глобальные настройки API
 API_ID = 32155028
 API_HASH = "ec906474420c7cc518e2245d5829924a"
 BOT_TOKEN = "7860968550:AAHNx_mJHsDrohp0DV60eTy1wCdl8gKxqmE"
 
-# Блокировщик для безопасной записи файлов
+# API Токен от @CryptoBot (Crypto Pay)
+CRYPTO_BOT_TOKEN = "611722:AARQbBBi1uLtIjPPcr9fwNl24y0SVbroSZG" 
+
+# Настройки SaaS
+ADMIN_ID = 7521801228
+FREE_LIMIT = 50
+SUB_PRICE_USD = 1.5
+WATERMARK = "\n\nОтправлено с помощью @nonewin_bot"
+
 config_lock = asyncio.Lock()
 
 def get_user_config_path(user_id: int) -> str:
@@ -31,10 +39,12 @@ def get_default_config() -> dict:
         "scenarios": {},
         "chats": [],
         "status": "stopped",
-        "session_names": []
+        "session_names": [],
+        "is_premium": False,
+        "daily_sent": 0,
+        "last_sent_date": ""
     }
 
-# Хранилище сессий: { user_id: { session_name: client } }
 telethon_accounts = {}
 active_auths = {}
 
@@ -54,13 +64,61 @@ async def load_config(user_id: int) -> dict:
             with open(file_path, "w", encoding="utf-8") as f:
                 json.dump(get_default_config(), f, ensure_ascii=False, indent=4)
         with open(file_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            
+            # Принудительная вечная подписка для админа
+            if user_id == ADMIN_ID:
+                data["is_premium"] = True
+                
+            # Проверка и сброс дневного лимита при наступлении нового дня
+            today = datetime.now().strftime("%Y-%m-%d")
+            if data.get("last_sent_date") != today:
+                data["daily_sent"] = 0
+                data["last_sent_date"] = today
+            return data
 
 async def save_config(user_id: int, config_data: dict):
     file_path = get_user_config_path(user_id)
     async with config_lock:
         with open(file_path, "w", encoding="utf-8") as f:
             json.dump(config_data, f, ensure_ascii=False, indent=4)
+
+# Взаимодействие с CryptoBot API
+async def create_crypto_invoice(amount: float, user_id: int):
+    url = "https://pay.crypton.me/api/createInvoice"
+    headers = {"Crypto-Pay-API-Token": CRYPTO_BOT_TOKEN}
+    payload = {
+        "asset": "USDT",
+        "amount": str(amount),
+        "description": "Подписка на премиум-план EgorMailer",
+        "payload": str(user_id),
+        "paid_btn_name": "openBot",
+        "paid_btn_url": "https://t.me/nonewin_bot"
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, headers=headers) as resp:
+                if resp.status == 200:
+                    res_json = await resp.json()
+                    if res_json.get("ok"):
+                        return res_json["result"]["pay_url"], res_json["result"]["invoice_id"]
+    except Exception as e:
+        print(f"Ошибка создания счета CryptoBot: {e}")
+    return None, None
+
+async def check_crypto_invoice(invoice_id: int):
+    url = f"https://pay.crypton.me/api/getInvoices?invoice_ids={invoice_id}"
+    headers = {"Crypto-Pay-API-Token": CRYPTO_BOT_TOKEN}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status == 200:
+                    res_json = await resp.json()
+                    if res_json.get("ok") and res_json["result"]["items"]:
+                        return res_json["result"]["items"][0]["status"] == "paid"
+    except Exception as e:
+        print(f"Ошибка проверки счета CryptoBot: {e}")
+    return False
 
 async def init_telethon_accounts_for_user(user_id: int):
     global telethon_accounts
@@ -74,9 +132,6 @@ async def init_telethon_accounts_for_user(user_id: int):
             await client.connect()
             if await client.is_user_authorized():
                 telethon_accounts[user_id][session_name] = client
-                print(f"[{user_id}] Юзербот-сессия {session_name} загружена.")
-            else:
-                print(f"[{user_id}] Сессия {session_name} не авторизована.")
         except Exception as e:
             print(f"❌ Ошибка загрузки сессии {session_name} для {user_id}: {e}")
 
@@ -104,25 +159,35 @@ async def mailing_worker_for_user(user_id: int):
                 if config["status"] != "started": 
                     break
                 
+                # Лимиты для обычных пользователей
+                if not config["is_premium"] and config["daily_sent"] >= FREE_LIMIT:
+                    config["status"] = "stopped"
+                    await save_config(user_id, config)
+                    print(f"🛑 Юзер {user_id} исчерпал дневной лимит.")
+                    break
+                
                 for acc_name, client in list(user_clients.items()):
                     try:
                         if not client.is_connected():
                             await client.connect()
                         
                         msg_text = config["scenarios"].get(acc_name, "Привет!")
-                        target = int(chat) if str(chat).lstrip('-').isdigit() else chat
                         
+                        # Если нет премиума — лепим вотермарку
+                        if not config["is_premium"]:
+                            msg_text += WATERMARK
+                            
+                        target = int(chat) if str(chat).lstrip('-').isdigit() else chat
                         await client.send_message(target, msg_text)
                         
                         config["stats"]["sent_count"] += 1
+                        config["daily_sent"] += 1
                         await save_config(user_id, config)
-                        print(f"[{user_id}][{acc_name}] Отправлено в {chat}")
+                        print(f"[{user_id}][{acc_name}] Отправлено в {chat} ({config['daily_sent']}/{FREE_LIMIT if not config['is_premium'] else '∞'})")
                         
                     except FloodWaitError as e:
-                        print(f"⚠️ Флуд [{user_id}]: спим {e.seconds} сек.")
                         await asyncio.sleep(e.seconds)
                     except Exception as e:
-                        print(f"❌ Ошибка отправки [{user_id}] с {acc_name} в {chat}: {e}")
                         try: await client.disconnect() 
                         except: pass
                     
@@ -138,7 +203,7 @@ def start_user_worker(user_id: int):
     if user_id not in active_workers or active_workers[user_id].done():
         active_workers[user_id] = asyncio.create_task(mailing_worker_for_user(user_id))
 
-def get_main_keyboard(status="stopped"):
+def get_main_keyboard(status="stopped", is_premium=False):
     if status == "started":
         status_row = [InlineKeyboardButton(text="🟢 РАССЫЛКА ИДЕТ 🟢", callback_data="ignore_click")]
         control_row = [InlineKeyboardButton(text="⏸ Пауза", callback_data="pause"), InlineKeyboardButton(text="⏹ Стоп", callback_data="stop")]
@@ -156,6 +221,10 @@ def get_main_keyboard(status="stopped"):
         [InlineKeyboardButton(text="⏱ Настроить задержки", callback_data="set_delay"), InlineKeyboardButton(text="📈 Статистика", callback_data="stats_view")],
         [InlineKeyboardButton(text="🔑 Аккаунты / Сессии", callback_data="accounts_manage")]
     ]
+    
+    if not is_premium:
+        buttons.append([InlineKeyboardButton(text="⭐ Купить Премиум ($1.5)", callback_data="buy_premium")])
+        
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 bot_storage = MemoryStorage()
@@ -163,19 +232,58 @@ dp = Dispatcher(storage=bot_storage)
 
 @dp.callback_query(F.data == "ignore_click")
 async def cb_ignore(callback: CallbackQuery):
-    await callback.answer("Это индикатор статуса 👆", show_alert=False)
+    await callback.answer()
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     user_id = message.from_user.id
     config = await load_config(user_id)
-    await message.answer("📋 **Главное меню панели управления рассылками:**", reply_markup=get_main_keyboard(config["status"]))
+    await message.answer("📋 **Главное меню панели управления рассылками:**", reply_markup=get_main_keyboard(config["status"], config["is_premium"]))
 
 @dp.callback_query(F.data == "back_to_menu")
 async def cb_back_to_menu(callback: CallbackQuery):
     user_id = callback.from_user.id
     config = await load_config(user_id)
-    await callback.message.edit_text("📋 **Главное меню панели управления рассылками:**", reply_markup=get_main_keyboard(config["status"]))
+    await callback.message.edit_text("📋 **Главное меню панели управления рассылками:**", reply_markup=get_main_keyboard(config["status"], config["is_premium"]))
+
+@dp.callback_query(F.data == "buy_premium")
+async def cb_buy_premium(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    config = await load_config(user_id)
+    if config["is_premium"]:
+        await callback.answer("⭐ У вас уже есть Премиум!", show_alert=True)
+        return
+        
+    pay_url, invoice_id = await create_crypto_invoice(SUB_PRICE_USD, user_id)
+    if not pay_url:
+        await callback.answer("❌ Ошибка платежной системы. Попробуйте позже.", show_alert=True)
+        return
+        
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💸 Оплатить $1.5 в CryptoBot", url=pay_url)],
+        [InlineKeyboardButton(text="✅ Проверить оплату", callback_data=f"check_pay_{invoice_id}")],
+        [InlineKeyboardButton(text="⬅ Назад", callback_data="back_to_menu")]
+    ])
+    await callback.message.edit_text("💎 **Покупка EgorMailer Premium**\n\n"
+                                    "• Без водных знаков бота\n"
+                                    "• Полное снятие лимита (более 50 писем в день)\n\n"
+                                    "Нажмите кнопку ниже для перехода к оплате:", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("check_pay_"))
+async def cb_check_pay(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    invoice_id = int(callback.data.replace("check_pay_", ""))
+    is_paid = await check_crypto_invoice(invoice_id)
+    
+    if is_paid:
+        config = await load_config(user_id)
+        config["is_premium"] = True
+        await save_config(user_id, config)
+        await callback.message.edit_text("🎉 **Поздравляем! Премиум успешно активирован!**\n"
+                                        "Лимиты сняты, водный знак отключен.", 
+                                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📥 В меню", callback_data="back_to_menu")]]))
+    else:
+        await callback.answer("❌ Оплата не найдена. Сначала оплатите счет в CryptoBot!", show_alert=True)
 
 @dp.callback_query(F.data == "start")
 async def cb_start(callback: CallbackQuery):
@@ -183,6 +291,9 @@ async def cb_start(callback: CallbackQuery):
     config = await load_config(user_id)
     user_clients = telethon_accounts.get(user_id, {})
     
+    if not config["is_premium"] and config["daily_sent"] >= FREE_LIMIT:
+        await callback.answer("❌ Вы исчерпали дневной лимит в 50 сообщений! Купите премиум.", show_alert=True)
+        return
     if not user_clients or not config.get("session_names"):
         await callback.answer("❌ Ошибка: Нет активных аккаунтов!", show_alert=True)
         return
@@ -192,7 +303,7 @@ async def cb_start(callback: CallbackQuery):
 
     config["status"] = "started"
     await save_config(user_id, config)
-    await callback.message.edit_reply_markup(reply_markup=get_main_keyboard(config["status"]))
+    await callback.message.edit_reply_markup(reply_markup=get_main_keyboard(config["status"], config["is_premium"]))
     await callback.answer("🚀 Рассылка успешно запущена!", show_alert=False)
     start_user_worker(user_id)
 
@@ -202,7 +313,7 @@ async def cb_pause(callback: CallbackQuery):
     config = await load_config(user_id)
     config["status"] = "paused"
     await save_config(user_id, config)
-    await callback.message.edit_reply_markup(reply_markup=get_main_keyboard(config["status"]))
+    await callback.message.edit_reply_markup(reply_markup=get_main_keyboard(config["status"], config["is_premium"]))
     await callback.answer("⏸ Поставлено на паузу.", show_alert=False)
 
 @dp.callback_query(F.data == "stop")
@@ -211,7 +322,7 @@ async def cb_stop(callback: CallbackQuery):
     config = await load_config(user_id)
     config["status"] = "stopped"
     await save_config(user_id, config)
-    await callback.message.edit_reply_markup(reply_markup=get_main_keyboard(config["status"]))
+    await callback.message.edit_reply_markup(reply_markup=get_main_keyboard(config["status"], config["is_premium"]))
     await callback.answer("⏹ Рассылка остановлена.", show_alert=False)
 
 @dp.callback_query(F.data == "reset_status")
@@ -220,8 +331,8 @@ async def cb_reset_status(callback: CallbackQuery):
     config = await load_config(user_id)
     config["status"] = "stopped"
     await save_config(user_id, config)
-    await callback.message.edit_reply_markup(reply_markup=get_main_keyboard(config["status"]))
-    await callback.answer("🔄 Статус успешно сброшен на 'Остановлено'.", show_alert=True)
+    await callback.message.edit_reply_markup(reply_markup=get_main_keyboard(config["status"], config["is_premium"]))
+    await callback.answer("🔄 Статус сброшен.", show_alert=True)
 
 @dp.callback_query(F.data == "deep_clean")
 async def cb_deep_clean(callback: CallbackQuery):
@@ -232,7 +343,7 @@ async def cb_deep_clean(callback: CallbackQuery):
     config["status"] = "stopped"
     config["stats"]["sent_count"] = 0
     await save_config(user_id, config)
-    await callback.message.edit_reply_markup(reply_markup=get_main_keyboard(config["status"]))
+    await callback.message.edit_reply_markup(reply_markup=get_main_keyboard(config["status"], config["is_premium"]))
     await callback.answer("🧹 Данные полностью очищены.", show_alert=True)
 
 @dp.callback_query(F.data == "scenario")
@@ -271,7 +382,7 @@ async def process_sc_text(message: Message, state: FSMContext):
     config = await load_config(user_id)
     config["scenarios"][acc_name] = message.text
     await save_config(user_id, config)
-    await message.answer(f"✅ Текст для **{acc_name}** обновлен!", reply_markup=get_main_keyboard(config["status"]))
+    await message.answer(f"✅ Текст для **{acc_name}** обновлен!", reply_markup=get_main_keyboard(config["status"], config["is_premium"]))
     await state.clear()
 
 @dp.callback_query(F.data == "chats_menu")
@@ -300,27 +411,27 @@ async def process_chats_list(message: Message, state: FSMContext):
     config = await load_config(user_id)
     config["chats"] = list(set(config["chats"] + cleaned))
     await save_config(user_id, config)
-    await message.answer(f"✅ Всего: {len(config['chats'])} чатов загружено.", reply_markup=get_main_keyboard(config["status"]))
+    await message.answer(f"✅ Всего: {len(config['chats'])} чатов загружено.", reply_markup=get_main_keyboard(config["status"], config["is_premium"]))
     await state.clear()
 
 @dp.callback_query(F.data == "set_delay")
 async def cb_set_delay(callback: CallbackQuery, state: FSMContext):
     await state.set_state(BotStates.waiting_for_delay_min)
-    await callback.message.answer("⏱ Введите **минимальную** задержку в секундах (целое число):")
+    await callback.message.answer("⏱ Введите **минимальную** задержку в секундах:")
 
 @dp.message(BotStates.waiting_for_delay_min)
 async def process_delay_min(message: Message, state: FSMContext):
     if not message.text.isdigit():
-        await message.answer("❌ Пожалуйста, введите корректное число:")
+        await message.answer("❌ Введите число:")
         return
     await state.update_data(min_delay=int(message.text))
     await state.set_state(BotStates.waiting_for_delay_max)
-    await message.answer("⏱ Введите **максимальную** задержку в секундах (целое число):")
+    await message.answer("⏱ Введите **максимальную** задержку в секундах:")
 
 @dp.message(BotStates.waiting_for_delay_max)
 async def process_delay_max(message: Message, state: FSMContext):
     if not message.text.isdigit():
-        await message.answer("❌ Пожалуйста, введите корректное число:")
+        await message.answer("❌ Введите число:")
         return
     user_id = message.from_user.id
     data = await state.get_data()
@@ -328,7 +439,7 @@ async def process_delay_max(message: Message, state: FSMContext):
     max_delay = int(message.text)
     
     if min_delay > max_delay:
-        await message.answer("❌ Минимальная задержка не может быть больше максимальной! Начните настройку сначала кнопкой из меню.")
+        await message.answer("❌ Ошибка. Начните заново.")
         await state.clear()
         return
 
@@ -336,8 +447,7 @@ async def process_delay_max(message: Message, state: FSMContext):
     config["delays"]["min"] = min_delay
     config["delays"]["max"] = max_delay
     await save_config(user_id, config)
-    
-    await message.answer(f"✅ Задержки успешно обновлены: **{min_delay}-{max_delay} сек.**", reply_markup=get_main_keyboard(config["status"]))
+    await message.answer(f"✅ Задержки обновлены: **{min_delay}-{max_delay} сек.**", reply_markup=get_main_keyboard(config["status"], config["is_premium"]))
     await state.clear()
 
 @dp.callback_query(F.data == "accounts_manage")
@@ -383,7 +493,7 @@ async def process_code(message: Message, state: FSMContext):
     user_id = message.from_user.id
     code = "".join(filter(str.isdigit, message.text))
     if not code:
-        await message.answer("❌ Нет цифр. Введите еще раз:")
+        await message.answer("❌ Введите еще раз:")
         return
     auth_data = active_auths.get(user_id)
     if not auth_data: return
@@ -398,7 +508,7 @@ async def process_code(message: Message, state: FSMContext):
         config["session_names"].append(auth_data["session_name"])
         await save_config(user_id, config)
         
-        await message.answer("✅ Аккаунт добавлен!", reply_markup=get_main_keyboard(config["status"]))
+        await message.answer("✅ Аккаунт добавлен!", reply_markup=get_main_keyboard(config["status"], config["is_premium"]))
         await state.clear()
         active_auths.pop(user_id, None)
     except SessionPasswordNeededError:
@@ -414,16 +524,13 @@ async def process_password(message: Message, state: FSMContext):
     if not auth_data: return
     try:
         await auth_data["client"].sign_in(password=message.text.strip())
-        
         if user_id not in telethon_accounts:
             telethon_accounts[user_id] = {}
-            
         telethon_accounts[user_id][auth_data["session_name"]] = auth_data["client"]
         config = await load_config(user_id)
         config["session_names"].append(auth_data["session_name"])
         await save_config(user_id, config)
-        
-        await message.answer("✅ Аккаунт добавлен!", reply_markup=get_main_keyboard(config["status"]))
+        await message.answer("✅ Аккаунт добавлен!", reply_markup=get_main_keyboard(config["status"], config["is_premium"]))
         await state.clear()
         active_auths.pop(user_id, None)
     except Exception as e:
@@ -433,8 +540,12 @@ async def process_password(message: Message, state: FSMContext):
 async def cb_stats_view(callback: CallbackQuery):
     user_id = callback.from_user.id
     config = await load_config(user_id)
+    
+    plan = "⭐ Premium (Бесконечно)" if config["is_premium"] else f"БЕСПЛАТНЫЙ ({config['daily_sent']}/{FREE_LIMIT} писем сегодня)"
+    
     text = (f"📊 **Ваша статистика:**\n\n"
-            f"• Отправлено сообщений: {config['stats']['sent_count']}\n"
+            f"• Ваш тариф: **{plan}**\n"
+            f"• Всего отправлено: {config['stats']['sent_count']}\n"
             f"• Текущая задержка: {config['delays']['min']}-{config['delays']['max']} сек.\n"
             f"• Загружено чатов: {len(config['chats'])}\n"
             f"• Активных аккаунтов: {len(config.get('session_names', []))}")
