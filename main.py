@@ -6,9 +6,7 @@ import os
 
 import random
 
-import time
-
-from datetime import datetime
+import re
 
 from aiogram import Bot, Dispatcher, F
 
@@ -24,13 +22,9 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 from telethon import TelegramClient
 
-from telethon.errors import FloodWaitError, SessionPasswordNeededError, ChatAdminRequiredError, ChannelPrivateError, UsernameNotOccupiedError, UsernameInvalidError
+from telethon.errors import FloodWaitError, SessionPasswordNeededError, ChannelPrivateError, UsernameNotOccupiedError, UsernameInvalidError
 
-from telethon.tl.types import User, UserStatusRecently, UserStatusLastWeek, UserStatusLastMonth, UserStatusOnline, UserStatusOffline, PeerUser
-
-from telethon.tl.functions.messages import SearchGlobalRequest
-
-import aiohttp
+from telethon.tl.types import User, PeerUser
 
 import aiosqlite
 
@@ -44,20 +38,9 @@ API_HASH = "ec906474420c7cc518e2245d5829924a"
 BOT_TOKEN = "7860968550:AAHNx_mJHsDrohp0DV60eTy1wCdl8gKxqmE"
 
 
-# API Токен от @CryptoBot (Crypto Pay)
+# Настройки
 
-CRYPTO_BOT_TOKEN = "611722:AARQbBBi1uLtIjPPcr9fwNl24y0SVbroSZG" 
-
-
-# Настройки SaaS
-
-ADMIN_ID = 7521801228  # Сюда будут приходить уведомления о покупках
-
-FREE_LIMIT = 50
-
-SUB_PRICE_USD = 1.5
-
-WATERMARK = "\n\nОтправлено с помощью @nonewin_bot"
+ADMIN_ID = 7521801228
 
 DB_PATH = "bot_database.db"
 
@@ -86,12 +69,6 @@ def get_default_config() -> dict:
 
         "session_names": [],
 
-        "is_premium": False,
-
-        "daily_sent": 0,
-
-        "last_sent_date": ""
-
     }
 
 
@@ -116,15 +93,9 @@ class BotStates(StatesGroup):
 
     waiting_for_delay_max = State()
 
-    waiting_for_parse_groups = State()
-
-    waiting_for_parse_account = State()
+    waiting_for_add_users = State()
 
     waiting_for_db_mailing_text = State()
-
-    waiting_for_search_keyword = State()
-
-    waiting_for_search_groups = State()
 
 
 async def load_config(user_id: int) -> dict:
@@ -143,19 +114,7 @@ async def load_config(user_id: int) -> dict:
 
             data = json.load(f)
 
-            
-
-            # Проверка и сброс дневного лимита при наступлении нового дня
-
-            today = datetime.now().strftime("%Y-%m-%d")
-
-            if data.get("last_sent_date") != today:
-
-                data["daily_sent"] = 0
-
-                data["last_sent_date"] = today
-
-            return data
+        return data
 
 
 async def save_config(user_id: int, config_data: dict):
@@ -198,6 +157,8 @@ async def init_db():
 
                 last_name TEXT,
 
+                display_name TEXT,
+
                 source_group TEXT,
 
                 is_bot INTEGER DEFAULT 0,
@@ -213,6 +174,16 @@ async def init_db():
             )
 
         """)
+
+        # Миграция: если таблица уже существовала без display_name, добавим колонку
+
+        try:
+
+            await db.execute("ALTER TABLE parsed_users ADD COLUMN display_name TEXT")
+
+        except Exception:
+
+            pass
 
         await db.execute("CREATE INDEX IF NOT EXISTS idx_owner_archived ON parsed_users(owner_id, archived)")
 
@@ -325,9 +296,9 @@ async def get_user_db_stats(owner_id: int) -> dict:
 
 async def get_active_user_ids(owner_id: int, include_archived: bool = False, limit: int = 50000):
 
-    """Возвращает список (db_id, user_id, username, first_name) для рассылки."""
+    """Возвращает список (db_id, user_id, username, first_name, display_name) для рассылки."""
 
-    sql = "SELECT id, user_id, username, first_name FROM parsed_users WHERE owner_id=?"
+    sql = "SELECT id, user_id, username, first_name, display_name FROM parsed_users WHERE owner_id=?"
 
     if not include_archived:
 
@@ -443,120 +414,88 @@ async def save_db_mailing_state(owner_id: int, **kwargs):
         await db.commit()
 
 
-# Взаимодействие с CryptoBot API (Официальный URL: https://pay.crypt.bot/api/)
-
-async def create_crypto_invoice(amount: float, user_id: int):
-
-    url = "https://pay.crypt.bot/api/createInvoice"
-
-    headers = {"Crypto-Pay-API-Token": CRYPTO_BOT_TOKEN}
-
-    payload = {
-
-        "asset": "USDT",
-
-        "amount": str(amount),
-
-        "description": "Подписка на премиум-план EgorMailer",
-
-        "payload": str(user_id),
-
-        "paid_btn_name": "openBot",
-
-        "paid_btn_url": "https://t.me/nonewin_bot"
-
-    }
-
-    try:
-
-        async with aiohttp.ClientSession() as session:
-
-            async with session.post(url, json=payload, headers=headers) as resp:
-
-                body = await resp.text()
-
-                if resp.status == 200:
-
-                    res_json = await resp.json() if body else {}
-
-                    if res_json.get("ok"):
-
-                        return res_json["result"]["pay_url"], res_json["result"]["invoice_id"], None
-
-                    else:
-
-                        # API ответил 200, но ok=false — покажем причину
-
-                        err = res_json.get("error", {})
-
-                        msg = f"API ok=false: name={err.get('name')}, code={err.get('code')}"
-
-                        print(f"[CryptoPay] {msg}")
-
-                        return None, None, msg
-
-                else:
-
-                    err_msg = f"HTTP {resp.status}: {body[:300]}"
-
-                    print(f"[CryptoPay] {err_msg}")
-
-                    return None, None, err_msg
-
-    except aiohttp.ClientConnectorError as e:
-
-        err_msg = f"Нет соединения с pay.crypt.bot: {e}"
-
-        print(f"[CryptoPay] {err_msg}")
-
-        return None, None, err_msg
-
-    except Exception as e:
-
-        err_msg = f"Исключение при создании счета: {e}"
-
-        print(f"[CryptoPay] {err_msg}")
-
-        return None, None, err_msg
-
-    return None, None, "Неизвестная ошибка"
+# ============================================================
+#   РУЧНОЕ ДОБАВЛЕНИЕ ПОЛЬЗОВАТЕЛЕЙ В БАЗУ
+# ============================================================
 
 
-async def check_crypto_invoice(invoice_id: int):
+_USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")
 
-    url = f"https://pay.crypt.bot/api/getInvoices?invoice_ids={invoice_id}"
 
-    headers = {"Crypto-Pay-API-Token": CRYPTO_BOT_TOKEN}
+def parse_user_line(line: str) -> tuple[str, str] | None:
+    """
+    Парсит строку формата '@username Имя Фамилия' или '@username'.
+    Возвращает (username, display_name) или None, если строка невалидная.
+    """
+    line = line.strip()
+    if not line:
+        return None
+    parts = line.split(maxsplit=1)
+    username = parts[0].lstrip("@").strip()
+    if not _USERNAME_RE.match(username):
+        return None
+    display_name = parts[1].strip() if len(parts) > 1 else ""
+    return username, display_name
+
+
+async def add_user_to_base(owner_id: int, user_id: int, username: str,
+                            first_name: str, last_name: str, display_name: str) -> None:
+    """Добавляет (или обновляет) юзера в базе."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO parsed_users
+               (owner_id, user_id, username, first_name, last_name, display_name, source_group, is_bot, archived)
+               VALUES (?, ?, ?, ?, ?, ?, 'manual', 0, 0)
+               ON CONFLICT(owner_id, user_id) DO UPDATE SET
+                 username=excluded.username,
+                 first_name=excluded.first_name,
+                 last_name=excluded.last_name,
+                 display_name=excluded.display_name,
+                 archived=0,
+                 archived_at=NULL""",
+            (owner_id, user_id, username, first_name, last_name, display_name or None)
+        )
+        await db.commit()
+
+
+async def resolve_and_add_user(owner_id: int, username: str, display_name: str,
+                                account_name: str) -> tuple[bool, str]:
+    """
+    Резолвит @username через telethon и добавляет в базу.
+    Возвращает (ok, message).
+    """
+    client = telethon_accounts.get(owner_id, {}).get(account_name)
+    if client is None:
+        return False, f"Аккаунт {account_name} не подключён"
 
     try:
-
-        async with aiohttp.ClientSession() as session:
-
-            async with session.get(url, headers=headers) as resp:
-
-                if resp.status == 200:
-
-                    res_json = await resp.json()
-
-                    if res_json.get("ok") and res_json["result"]["items"]:
-
-                        return res_json["result"]["items"][0]["status"] == "paid"
-
-                    else:
-
-                        err = res_json.get("error", {})
-
-                        print(f"[CryptoPay] getInvoices ok=false: {err}")
-
-                else:
-
-                    print(f"[CryptoPay] getInvoices HTTP {resp.status}: {await resp.text()}")
-
+        client = await _ensure_client_connected(client, account_name, owner_id)
+        if client is None:
+            return False, f"Не удалось подключиться к {account_name}"
+        entity = await client.get_entity(username)
+    except UsernameNotOccupiedError:
+        return False, f"❌ @{username} — не существует"
+    except UsernameInvalidError:
+        return False, f"❌ @{username} — невалидный username"
     except Exception as e:
+        return False, f"❌ @{username} — ошибка: {type(e).__name__}: {e}"
 
-        print(f"[CryptoPay] Ошибка проверки счета: {e}")
+    if not isinstance(entity, User):
+        return False, f"❌ @{username} — это не пользователь"
+    if getattr(entity, "bot", False):
+        return False, f"❌ @{username} — это бот"
 
-    return False
+    await add_user_to_base(
+        owner_id=owner_id,
+        user_id=entity.id,
+        username=entity.username or username,
+        first_name=entity.first_name or "",
+        last_name=entity.last_name or "",
+        display_name=display_name,
+    )
+
+    shown = display_name or entity.first_name or entity.username or username
+    return True, f"✅ @{entity.username or username} → {shown} добавлен(а)"
 
 
 async def init_telethon_accounts_for_user(user_id: int):
@@ -636,747 +575,12 @@ async def init_all_existing_accounts():
 
 # ============================================================
 
-#   ПАРСЕР УЧАСТНИКОВ ГРУПП
-
-# ============================================================
-
-
-active_parsers = {}  # owner_id -> asyncio.Task
-
-
-def _is_real_user(user) -> bool:
-
-    """Отфильтровывает ботов, удалённые аккаунты и пустых юзеров."""
-
-    if not isinstance(user, User):
-
-        return False
-
-    if getattr(user, "bot", False):
-
-        return False
-
-    if getattr(user, "deleted", False):
-
-        return False
-
-    if not user.id:
-
-        return False
-
-    return True
-
-
-def _status_to_str(user) -> str:
-
-    s = getattr(user, "status", None)
-
-    if isinstance(s, UserStatusOnline): return "online"
-
-    if isinstance(s, UserStatusRecently): return "recently"
-
-    if isinstance(s, UserStatusLastWeek): return "last_week"
-
-    if isinstance(s, UserStatusLastMonth): return "last_month"
-
-    if isinstance(s, UserStatusOffline): return "offline"
-
-    return "unknown"
-
-
-async def parse_users_from_groups(bot: Bot, owner_id: int, groups: list, account_name: str, status_msg: Message):
-
-    """
-
-    Фоновый парсинг. Шлёт прогресс в status_msg, по окончанию — итог.
-
-    """
-
-    client = telethon_accounts.get(owner_id, {}).get(account_name)
-
-    if client is None:
-
-        await status_msg.edit_text(f"❌ Аккаунт **{account_name}** не найден или не подключён. Откройте ‘Аккаунты / Сессии’ и добавьте заново.")
-
-        return
-
-
-    total_added = 0
-
-    total_seen = 0
-
-    groups_done = 0
-
-    groups_failed = []
-
-    await status_msg.edit_text(f"👥 Парсинг запущен. Групп в очереди: **{len(groups)}**\nАккаунт: **{account_name}**\n\nПрогресс будет обновляться…")
-
-
-    for group_ref in groups:
-
-        group_label = group_ref
-
-        try:
-
-            try:
-
-                entity = await client.get_entity(group_ref)
-
-            except (UsernameNotOccupiedError, UsernameInvalidError, ValueError):
-
-                groups_failed.append(f"{group_ref} (не найден)")
-
-                continue
-
-            except (ChannelPrivateError, ChatAdminRequiredError) as e:
-
-                groups_failed.append(f"{group_ref} (нет доступа)")
-
-                continue
-
-            except Exception as e:
-
-                groups_failed.append(f"{group_ref} ({type(e).__name__})")
-
-                continue
-
-
-            group_title = getattr(entity, "title", None) or getattr(entity, "username", None) or str(group_ref)
-
-            group_label = group_title
-
-
-            batch = []
-
-            seen_in_group = 0
-
-            last_progress = time.time()
-
-            try:
-
-                async for u in client.iter_participants(entity, aggressive=True):
-
-                    if not _is_real_user(u):
-
-                        continue
-
-                    seen_in_group += 1
-
-                    total_seen += 1
-
-                    batch.append({
-
-                        "user_id": u.id,
-
-                        "username": u.username,
-
-                        "first_name": u.first_name,
-
-                        "last_name": u.last_name,
-
-                        "is_bot": False,
-
-                    })
-
-                    # Пачками по 200 — пишем в БД и шлём прогресс
-
-                    if len(batch) >= 200:
-
-                        added = await add_parsed_users_bulk(owner_id, batch, group_title)
-
-                        total_added += added
-
-                        batch.clear()
-
-                        if time.time() - last_progress > 3:
-
-                            try:
-
-                                await status_msg.edit_text(
-
-                                    f"👥 Парсинг...\n\n"
-
-                                    f"📌 Сейчас: **{group_title}**\n"
-
-                                    f"👁 Обработано в группе: {seen_in_group}\n"
-
-                                    f"✅ Всего новых в базе: {total_added}\n"
-
-                                    f"📦 Групп готово: {groups_done}/{len(groups)}"
-
-                                )
-
-                            except Exception:
-
-                                pass
-
-                            last_progress = time.time()
-
-                    # Лёгкий троттлинг чтобы не упереться в FloodWait
-
-                    if seen_in_group % 500 == 0:
-
-                        await asyncio.sleep(1)
-
-                if batch:
-
-                    added = await add_parsed_users_bulk(owner_id, batch, group_title)
-
-                    total_added += added
-
-            except FloodWaitError as e:
-
-                # Ждём FloodWait и продолжаем со следующей группой (эту бросаем)
-
-                groups_failed.append(f"{group_title} (FloodWait {e.seconds}s)")
-
-                try:
-
-                    await status_msg.edit_text(
-
-                        f"⏳ FloodWait {e.seconds}s на группе **{group_title}** — пропускаю и иду дальше.\n"
-
-                        f"✅ Уже добавлено: {total_added}\n"
-
-                        f"📦 Осталось групп: {len(groups) - groups_done - 1}"
-
-                    )
-
-                except Exception:
-
-                    pass
-
-                await asyncio.sleep(min(e.seconds, 60))
-
-            except Exception as e:
-
-                groups_failed.append(f"{group_title} ({type(e).__name__}: {e})")
-
-
-            groups_done += 1
-
-            await asyncio.sleep(2)  # пауза между группами
-
-        except Exception as e:
-
-            groups_failed.append(f"{group_label} ({type(e).__name__})")
-
-
-    # Итог
-
-    stats = await get_user_db_stats(owner_id)
-
-    fail_text = "\n".join(f"  • {g}" for g in groups_failed) if groups_failed else "  —"
-
-    await status_msg.edit_text(
-
-        f"✅ **Парсинг завершён!**\n\n"
-
-        f"📦 Обработано групп: {groups_done}/{len(groups)}\n"
-
-        f"👁 Всего юзеров просмотрено: {total_seen}\n"
-
-        f"🆕 Добавлено в базу (новых): {total_added}\n\n"
-
-        f"📊 **Состояние базы:**\n"
-
-        f"  • Всего: {stats['total']}\n"
-
-        f"  • Активных (не в архиве): {stats['active']}\n"
-
-        f"  • В архиве: {stats['archived']}\n"
-
-        f"  • Источников-групп: {stats['groups']}\n\n"
-
-        f"⚠️ **Пропущены:**\n{fail_text}",
-
-        reply_markup=get_db_keyboard()
-
-    )
-
-    print(f"[PARSER] [{owner_id}] Готово. +{total_added} юзеров, пропущено групп: {len(groups_failed)}")
-
-
-# ============================================================
-
 #   РАССЫЛКА ПО БАЗЕ (ЛС каждому юзеру → автоархив)
 
 # ============================================================
 
 
 active_db_mailings = {}  # owner_id -> asyncio.Task
-
-
-# ============================================================
-
-#   ПОИСК ЮЗЕРОВ ПО КЛЮЧЕВОМУ СЛОВУ (через сообщения)
-
-# ============================================================
-
-
-active_searches = {}  # owner_id -> asyncio.Task
-
-
-def _extract_user_from_msg(msg) -> dict | None:
-
-    """Извлекает user_id (+ опционально username/first_name) из сообщения."""
-
-    if not msg or not msg.from_id:
-
-        return None
-
-    if not isinstance(msg.from_id, PeerUser):
-
-        return None
-
-    user_id = msg.from_id.user_id
-
-    if not user_id:
-
-        return None
-
-    sender = getattr(msg, "sender", None)
-
-    return {
-
-        "user_id": user_id,
-
-        "username": getattr(sender, "username", None) if sender else None,
-
-        "first_name": getattr(sender, "first_name", None) if sender else None,
-
-        "last_name": getattr(sender, "last_name", None) if sender else None,
-
-    }
-
-
-async def search_in_groups(bot: Bot, owner_id: int, keyword: str, groups: list, account_name: str, status_msg: Message):
-
-    """
-
-    Поиск сообщений с keyword по списку чатов.
-
-    Каждое найденное сообщение → user_id автора → в БД.
-
-    """
-
-    client = telethon_accounts.get(owner_id, {}).get(account_name)
-
-    if client is None:
-
-        await status_msg.edit_text(f"❌ Аккаунт **{account_name}** не подключён.")
-
-        return
-
-
-    await status_msg.edit_text(
-
-        f"🔍 **Поиск запущен**\n\n"
-
-        f"🔑 Ключевое слово: `{keyword}`\n"
-
-        f"👤 Аккаунт: **{account_name}**\n"
-
-        f"📦 Чатов в очереди: {len(groups)}\n\n"
-
-        f"⏳ Прогресс будет обновляться…"
-
-    )
-
-
-    total_found = 0
-
-    total_added = 0
-
-    total_messages = 0
-
-    groups_done = 0
-
-    groups_failed = []
-
-
-    for group_ref in groups:
-
-        group_label = group_ref
-
-        try:
-
-            try:
-
-                entity = await client.get_entity(group_ref)
-
-            except (UsernameNotOccupiedError, UsernameInvalidError, ValueError):
-
-                groups_failed.append(f"{group_ref} (не найден)")
-
-                continue
-
-            except (ChannelPrivateError, ChatAdminRequiredError):
-
-                groups_failed.append(f"{group_ref} (нет доступа)")
-
-                continue
-
-            except Exception as e:
-
-                groups_failed.append(f"{group_ref} ({type(e).__name__})")
-
-                continue
-
-
-            group_title = getattr(entity, "title", None) or getattr(entity, "username", None) or str(group_ref)
-
-            group_label = group_title
-
-
-            batch = []
-
-            last_progress = time.time()
-
-            try:
-
-                # limit=300 на чат — больше Telegram обычно не отдаёт по поиску
-
-                async for msg in client.iter_messages(entity, search=keyword, limit=300):
-
-                    total_messages += 1
-
-                    u = _extract_user_from_msg(msg)
-
-                    if u is None:
-
-                        continue
-
-                    total_found += 1
-
-                    batch.append(u)
-
-                    if len(batch) >= 100:
-
-                        added = await add_parsed_users_bulk(owner_id, batch, f"search:{keyword}:{group_title}")
-
-                        total_added += added
-
-                        batch.clear()
-
-                    if total_messages % 50 == 0 and time.time() - last_progress > 3:
-
-                        try:
-
-                            await status_msg.edit_text(
-
-                                f"🔍 **Поиск…**\n\n"
-
-                                f"📌 Сейчас: **{group_title}**\n"
-
-                                f"🔎 Просмотрено сообщений: {total_messages}\n"
-
-                                f"👤 Найдено авторов: {total_found}\n"
-
-                                f"✅ Добавлено в базу: {total_added}\n"
-
-                                f"📦 Групп готово: {groups_done}/{len(groups)}"
-
-                            )
-
-                        except Exception:
-
-                            pass
-
-                        last_progress = time.time()
-
-                if batch:
-
-                    added = await add_parsed_users_bulk(owner_id, batch, f"search:{keyword}:{group_title}")
-
-                    total_added += added
-
-            except FloodWaitError as e:
-
-                groups_failed.append(f"{group_title} (FloodWait {e.seconds}s)")
-
-                try:
-
-                    await status_msg.edit_text(
-
-                        f"⏳ FloodWait {e.seconds}s на **{group_title}** — пропускаю.\n"
-
-                        f"✅ Уже найдено: {total_found} авторов, добавлено: {total_added}"
-
-                    )
-
-                except Exception:
-
-                    pass
-
-                await asyncio.sleep(min(e.seconds, 60))
-
-            except Exception as e:
-
-                groups_failed.append(f"{group_title} ({type(e).__name__}: {e})")
-
-
-            groups_done += 1
-
-            await asyncio.sleep(2)
-
-        except Exception as e:
-
-            groups_failed.append(f"{group_label} ({type(e).__name__})")
-
-
-    stats = await get_user_db_stats(owner_id)
-
-    fail_text = "\n".join(f"  • {g}" for g in groups_failed) if groups_failed else "  —"
-
-    await status_msg.edit_text(
-
-        f"✅ **Поиск завершён!**\n\n"
-
-        f"🔑 Ключевое слово: `{keyword}`\n"
-
-        f"📦 Обработано чатов: {groups_done}/{len(groups)}\n"
-
-        f"🔎 Просмотрено сообщений: {total_messages}\n"
-
-        f"👤 Уникальных авторов найдено: {total_found}\n"
-
-        f"🆕 Добавлено в базу (новых): {total_added}\n\n"
-
-        f"📊 **Состояние базы:**\n"
-
-        f"  • Всего: {stats['total']}\n"
-
-        f"  • Активных: {stats['active']}\n"
-
-        f"  • В архиве: {stats['archived']}\n\n"
-
-        f"⚠️ **Пропущены:**\n{fail_text}\n\n"
-
-        f"💡 Можно сразу запустить «Рассылка по базе (ЛС)».",
-
-        reply_markup=get_db_keyboard()
-
-    )
-
-    print(f"[SEARCH] [{owner_id}] keyword='{keyword}' found={total_found} added={total_added}")
-
-
-async def search_global(bot: Bot, owner_id: int, keyword: str, account_name: str, status_msg: Message):
-
-    """
-
-    Глобальный поиск по всем чатам. Требует Premium на аккаунте-поисковике.
-
-    """
-
-    client = telethon_accounts.get(owner_id, {}).get(account_name)
-
-    if client is None:
-
-        await status_msg.edit_text(f"❌ Аккаунт **{account_name}** не подключён.")
-
-        return
-
-
-    await status_msg.edit_text(
-
-        f"🔍 **Глобальный поиск запущен**\n\n"
-
-        f"🔑 Ключевое слово: `{keyword}`\n"
-
-        f"👤 Аккаунт: **{account_name}**\n"
-
-        f"⭐ Требуется Telegram Premium на аккаунте-поисковике.\n\n"
-
-        f"⏳ Идёт поиск по всем чатам…"
-
-    )
-
-
-    total_found = 0
-
-    total_added = 0
-
-    total_messages = 0
-
-    offset_rate = 0
-
-    offset_peer = None
-
-    pages = 0
-
-    max_pages = 20  # предохранитель — больше 2000 сообщений не тянем
-
-
-    try:
-
-        while pages < max_pages:
-
-            pages += 1
-
-            try:
-
-                result = await client(SearchGlobalRequest(
-
-                    q=keyword,
-
-                    offset_rate=offset_rate,
-
-                    offset_peer=offset_peer,
-
-                    offset_id=0,
-
-                    limit=100,
-
-                ))
-
-            except Exception as e:
-
-                err_name = type(e).__name__
-
-                if "premium" in str(e).lower() or "FAKE_PREMIUM_REQUIRED" in str(e) or "FILTER_SEARCH_TOO_MANY" in str(e):
-
-                    await status_msg.edit_text(
-
-                        f"⚠️ **Глобальный поиск недоступен**\n\n"
-
-                        f"Причина: `{err_name}`\n\n"
-
-                        f"💡 Обычно Telegram требует **Premium** на аккаунте-поисковике.\n"
-
-                        f"Либо используй «Поиск по списку чатов».",
-
-                        reply_markup=get_db_keyboard()
-
-                    )
-
-                    return
-
-                raise
-
-
-            messages = getattr(result, "messages", [])
-
-            if not messages:
-
-                break
-
-
-            batch = []
-
-            for msg in messages:
-
-                total_messages += 1
-
-                u = _extract_user_from_msg(msg)
-
-                if u is None:
-
-                    continue
-
-                total_found += 1
-
-                batch.append(u)
-
-            if batch:
-
-                added = await add_parsed_users_bulk(owner_id, batch, f"search_global:{keyword}")
-
-                total_added += added
-
-
-            if total_messages % 200 == 0 or pages == 1:
-
-                try:
-
-                    await status_msg.edit_text(
-
-                        f"🔍 **Глобальный поиск…**\n"
-
-                        f"🔑 `{keyword}`\n"
-
-                        f"🔎 Просмотрено: {total_messages} сообщений\n"
-
-                        f"👤 Найдено авторов: {total_found}\n"
-
-                        f"✅ Добавлено: {total_added}"
-
-                    )
-
-                except Exception:
-
-                    pass
-
-
-            # Следующая страница
-
-            offset_rate = getattr(result, "next_rate", None) or getattr(result, "rate", None) or 0
-
-            if hasattr(result, "next_peer") and result.next_peer:
-
-                offset_peer = result.next_peer
-
-            if not messages or len(messages) < 100:
-
-                break
-
-            await asyncio.sleep(1)
-
-    except FloodWaitError as e:
-
-        await status_msg.edit_text(
-
-            f"⏳ FloodWait {e.seconds}s — жду и продолжаю.\n"
-
-            f"Пока: найдено {total_found}, добавлено {total_added}"
-
-        )
-
-        await asyncio.sleep(min(e.seconds, 60))
-
-    except Exception as e:
-
-        await status_msg.edit_text(
-
-            f"❌ Ошибка глобального поиска: {type(e).__name__}: {e}",
-
-            reply_markup=get_db_keyboard()
-
-        )
-
-        return
-
-
-    stats = await get_user_db_stats(owner_id)
-
-    await status_msg.edit_text(
-
-        f"✅ **Глобальный поиск завершён!**\n\n"
-
-        f"🔑 Ключевое слово: `{keyword}`\n"
-
-        f"🔎 Просмотрено сообщений: {total_messages}\n"
-
-        f"👤 Уникальных авторов: {total_found}\n"
-
-        f"🆕 Добавлено в базу: {total_added}\n\n"
-
-        f"📊 **База:**\n"
-
-        f"  • Всего: {stats['total']}\n"
-
-        f"  • Активных: {stats['active']}\n"
-
-        f"  • В архиве: {stats['archived']}\n\n"
-
-        f"💡 Можно сразу запустить «Рассылка по базе (ЛС)».",
-
-        reply_markup=get_db_keyboard()
-
-    )
-
-    print(f"[SEARCH-GLOBAL] [{owner_id}] keyword='{keyword}' found={total_found} added={total_added}")
 
 
 async def db_mailing_worker(bot: Bot, owner_id: int, status_msg: Message):
@@ -1439,7 +643,7 @@ async def db_mailing_worker(bot: Bot, owner_id: int, status_msg: Message):
 
     failed = 0
 
-    for idx, (db_id, tg_user_id, username, first_name) in enumerate(rows):
+    for idx, (db_id, tg_user_id, username, first_name, display_name) in enumerate(rows):
 
         # Проверка статуса (можно остановить кнопкой)
 
@@ -1464,29 +668,9 @@ async def db_mailing_worker(bot: Bot, owner_id: int, status_msg: Message):
             return
 
 
-        # Проверка дневного лимита
+        # Подгружаем конфиг (нужны только задержки и счётчик отправок)
 
         config = await load_config(owner_id)
-
-        if not config["is_premium"] and config["daily_sent"] >= FREE_LIMIT:
-
-            await save_db_mailing_state(owner_id, status="stopped")
-
-            await status_msg.edit_text(
-
-                f"🛑 **Дневной лимит исчерпан!**\n\n"
-
-                f"✅ Отправлено: {sent}\n"
-
-                f"❌ Ошибок: {failed}\n"
-
-                f"⭐ Купите Премиум, чтобы продолжить.",
-
-                reply_markup=get_db_keyboard()
-
-            )
-
-            return
 
 
         # Гарантируем коннект
@@ -1512,6 +696,14 @@ async def db_mailing_worker(bot: Bot, owner_id: int, status_msg: Message):
 
         personal = text
 
+        if "{user}" in personal:
+
+            user_name = (display_name or first_name
+
+                         or (f"@{username}" if username else "друг"))
+
+            personal = personal.replace("{user}", user_name)
+
         if "{first_name}" in personal and first_name:
 
             personal = personal.replace("{first_name}", first_name)
@@ -1532,8 +724,6 @@ async def db_mailing_worker(bot: Bot, owner_id: int, status_msg: Message):
             await mark_user_archived(db_id)
 
             config["stats"]["sent_count"] += 1
-
-            config["daily_sent"] += 1
 
             await save_config(owner_id, config)
 
@@ -1560,8 +750,6 @@ async def db_mailing_worker(bot: Bot, owner_id: int, status_msg: Message):
                 await mark_user_archived(db_id)
 
                 config["stats"]["sent_count"] += 1
-
-                config["daily_sent"] += 1
 
                 await save_config(owner_id, config)
 
@@ -1747,19 +935,6 @@ async def mailing_worker_for_user(user_id: int):
                         break
 
 
-                    # Лимит для free-юзеров
-
-                    if not config["is_premium"] and config["daily_sent"] >= FREE_LIMIT:
-
-                        config["status"] = "stopped"
-
-                        await save_config(user_id, config)
-
-                        print(f"🛑 [{user_id}] Дневной лимит исчерпан, рассылка остановлена")
-
-                        break
-
-
                     # Пройдёмся по всем аккаунтам
 
                     for acc_name, client in list(user_clients.items()):
@@ -1769,10 +944,6 @@ async def mailing_worker_for_user(user_id: int):
                         config = await load_config(user_id)
 
                         if config["status"] != "started":
-
-                            break
-
-                        if not config["is_premium"] and config["daily_sent"] >= FREE_LIMIT:
 
                             break
 
@@ -1788,10 +959,6 @@ async def mailing_worker_for_user(user_id: int):
 
                             msg_text = config["scenarios"].get(acc_name, "Привет!")
 
-                            if not config["is_premium"]:
-
-                                msg_text += WATERMARK
-
 
                             target = int(chat) if str(chat).lstrip('-').isdigit() else chat
 
@@ -1800,11 +967,9 @@ async def mailing_worker_for_user(user_id: int):
 
                             config["stats"]["sent_count"] += 1
 
-                            config["daily_sent"] += 1
-
                             await save_config(user_id, config)
 
-                            print(f"📤 [{user_id}][{acc_name}] → {chat} ({config['daily_sent']}/{FREE_LIMIT if not config['is_premium'] else '∞'})")
+                            print(f"📤 [{user_id}][{acc_name}] → {chat} (всего: {config['stats']['sent_count']})")
 
 
                         except FloodWaitError as e:
@@ -1872,7 +1037,7 @@ def start_user_worker(user_id: int):
         active_workers[user_id] = asyncio.create_task(mailing_worker_for_user(user_id))
 
 
-def get_main_keyboard(status="stopped", is_premium=False, db_mailing_status="stopped"):
+def get_main_keyboard(status="stopped", db_mailing_status="stopped"):
 
     if status == "started":
 
@@ -1895,7 +1060,7 @@ def get_main_keyboard(status="stopped", is_premium=False, db_mailing_status="sto
 
     # Подсветка для активной рассылки по базе
 
-    db_label = "📤 Рассылка по базе идёт" if db_mailing_status == "started" else "👥 Парсер / База юзеров"
+    db_label = "📤 Рассылка по базе идёт" if db_mailing_status == "started" else "👥 База получателей"
 
 
     buttons = [
@@ -1914,13 +1079,6 @@ def get_main_keyboard(status="stopped", is_premium=False, db_mailing_status="sto
 
     ]
 
-    
-
-    if not is_premium:
-
-        buttons.append([InlineKeyboardButton(text="⭐ Купить Премиум ($1.5)", callback_data="buy_premium")])
-
-        
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -1929,11 +1087,11 @@ def get_db_keyboard():
 
     return InlineKeyboardMarkup(inline_keyboard=[
 
-        [InlineKeyboardButton(text="👥 Спарсить группу", callback_data="db_parse"),
+        [InlineKeyboardButton(text="➕ Добавить пользователей", callback_data="db_add_users")],
 
-         InlineKeyboardButton(text="🔍 Поиск по слову", callback_data="db_search")],
+        [InlineKeyboardButton(text="📊 Статистика базы", callback_data="db_stats"),
 
-        [InlineKeyboardButton(text="📊 Статистика базы", callback_data="db_stats")],
+         InlineKeyboardButton(text="📋 Список", callback_data="db_list_users")],
 
         [InlineKeyboardButton(text="📤 Рассылка по базе (ЛС)", callback_data="db_mailing")],
 
@@ -1959,8 +1117,6 @@ async def build_main_kb(user_id: int):
     return get_main_keyboard(
 
         config["status"],
-
-        config["is_premium"],
 
         db_state.get("status", "stopped")
 
@@ -2001,112 +1157,6 @@ async def cb_back_to_menu(callback: CallbackQuery):
     await callback.message.edit_text("📋 **Главное меню панели управления рассылками:**", reply_markup=await build_main_kb(callback.from_user.id))
 
 
-@dp.callback_query(F.data == "buy_premium")
-
-async def cb_buy_premium(callback: CallbackQuery):
-
-    user_id = callback.from_user.id
-
-    config = await load_config(user_id)
-
-    if config["is_premium"]:
-
-        await callback.answer("⭐ У вас уже есть Премиум!", show_alert=True)
-
-        return
-
-        
-
-    pay_url, invoice_id, err = await create_crypto_invoice(SUB_PRICE_USD, user_id)
-
-    if not pay_url:
-
-        # Покажем конкретную причину — пригодится для дебага
-
-        detail = f"\n\nПричина: {err}" if err else ""
-
-        await callback.answer(f"❌ Ошибка платежной системы. Проверьте настройки приложения в Crypto Pay.{detail}", show_alert=True)
-
-        return
-
-        
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-
-        [InlineKeyboardButton(text="💸 Оплатить $1.5 в CryptoBot", url=pay_url)],
-
-        [InlineKeyboardButton(text="✅ Проверить оплату", callback_data=f"check_pay_{invoice_id}")],
-
-        [InlineKeyboardButton(text="⬅ Назад", callback_data="back_to_menu")]
-
-    ])
-
-    await callback.message.edit_text("💎 **Покупка EgorMailer Premium**\n\n"
-
-                                    "• Без водных знаков бота\n"
-
-                                    "• Полное снятие лимита (более 50 писем в день)\n\n"
-
-                                    "Нажмите кнопку ниже для перехода к оплате:", reply_markup=kb)
-
-
-@dp.callback_query(F.data.startswith("check_pay_"))
-
-async def cb_check_pay(callback: CallbackQuery, bot: Bot):
-
-    user_id = callback.from_user.id
-
-    invoice_id = int(callback.data.replace("check_pay_", ""))
-
-    is_paid = await check_crypto_invoice(invoice_id)
-
-    
-
-    if is_paid:
-
-        config = await load_config(user_id)
-
-        config["is_premium"] = True
-
-        await save_config(user_id, config)
-
-        await callback.message.edit_text("🎉 **Поздравляем! Премиум успешно активирован!**\n"
-
-                                        "Лимиты сняты, водный знак отключен.", 
-
-                                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📥 В меню", callback_data="back_to_menu")]]))
-
-        
-
-        try:
-
-            username = f"@{callback.from_user.username}" if callback.from_user.username else "Нет юзернейма"
-
-            await bot.send_message(
-
-                chat_id=ADMIN_ID,
-
-                text=f"💰 **Новая покупка подписки!**\n\n"
-
-                     f"• Пользователь: {callback.from_user.full_name}\n"
-
-                     f"• Юзернейм: {username}\n"
-
-                     f"• ID: `{user_id}`\n"
-
-                     f"• Сумма: {SUB_PRICE_USD}$ через CryptoBot"
-
-            )
-
-        except Exception as e:
-
-            print(f"Не удалось отправить уведомление админу: {e}")
-
-    else:
-
-        await callback.answer("❌ Оплата не найдена. Сначала оплатите счет в CryptoBot!", show_alert=True)
-
-
 @dp.callback_query(F.data == "start")
 
 async def cb_start(callback: CallbackQuery):
@@ -2116,14 +1166,6 @@ async def cb_start(callback: CallbackQuery):
     config = await load_config(user_id)
 
     user_clients = telethon_accounts.get(user_id, {})
-
-    
-
-    if not config["is_premium"] and config["daily_sent"] >= FREE_LIMIT:
-
-        await callback.answer("❌ Вы исчерпали дневной лимит в 50 сообщений! Купите премиум.", show_alert=True)
-
-        return
 
     if not user_clients or not config.get("session_names"):
 
@@ -2335,15 +1377,13 @@ async def cb_db_menu(callback: CallbackQuery):
 
     text = (
 
-        f"👥 **Парсер / База юзеров**\n\n"
+        f"👥 **База получателей**\n\n"
 
         f"📊 В базе: **{stats['total']}** (активных: {stats['active']}, в архиве: {stats['archived']})\n"
 
-        f"📦 Источников-групп: {stats['groups']}\n"
-
         f"📤 Рассылка по базе: **{mailing_status}**\n\n"
 
-        f"Выберите действие:"
+        f"Добавляйте пользователей вручную с именами (для плейсхолдера `{{user}}`) и запускайте рассылку."
 
     )
 
@@ -2366,371 +1406,102 @@ async def cb_db_stats(callback: CallbackQuery):
 
         f"✅ Активных (доступны для рассылки): **{stats['active']}**\n"
 
-        f"🗂 В архиве: **{stats['archived']}**\n"
-
-        f"🤖 Ботов отфильтровано: {stats['bots']}\n"
-
-        f"📦 Уникальных групп-источников: {stats['groups']}"
+        f"🗂 В архиве: **{stats['archived']}**"
 
     )
 
     await callback.message.edit_text(text, reply_markup=get_db_keyboard())
 
 
-@dp.callback_query(F.data == "db_search")
+@dp.callback_query(F.data == "db_list_users")
 
-async def cb_db_search(callback: CallbackQuery):
-
-    user_id = callback.from_user.id
-
-    config = await load_config(user_id)
-
-    if not config.get("session_names"):
-
-        await callback.answer("❌ Сначала добавьте аккаунт!", show_alert=True)
-
-        return
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-
-        [InlineKeyboardButton(text="🌐 Глобально (по всем чатам, нужен Premium)", callback_data="db_search_global")],
-
-        [InlineKeyboardButton(text="📋 По списку чатов", callback_data="db_search_in_groups")],
-
-        [InlineKeyboardButton(text="⬅ Назад", callback_data="db_menu")],
-
-    ])
-
-    await callback.message.edit_text(
-
-        "🔍 **Поиск по ключевому слову**\n\n"
-
-        "Ищет сообщения с указанным словом и собирает `user_id` авторов.\n\n"
-
-        "📌 **Глобально** — по всем чатам аккаунта. Работает только если аккаунт-поисковик имеет **Telegram Premium**.\n\n"
-
-        "📋 **По списку чатов** — ищет только в тех чатах, которые вы укажете. Работает на любом аккаунте.\n\n"
-
-        "Что хотите сделать?",
-
-        reply_markup=kb
-
-    )
-
-
-@dp.callback_query(F.data == "db_search_global")
-
-async def cb_db_search_global(callback: CallbackQuery, state: FSMContext):
+async def cb_db_list_users(callback: CallbackQuery):
 
     user_id = callback.from_user.id
 
-    config = await load_config(user_id)
+    async with aiosqlite.connect(DB_PATH) as db:
 
-    await state.set_state(BotStates.waiting_for_search_keyword)
+        cur = await db.execute(
 
-    await state.update_data(search_mode="global")
+            "SELECT user_id, username, first_name, display_name, archived "
 
-    if len(config["session_names"]) > 1:
+            "FROM parsed_users WHERE owner_id=? ORDER BY id DESC LIMIT 200",
 
-        # Запомним пока что выбор первого, но ниже дадим сменить через аккаунт
-
-        await state.update_data(search_account=config["session_names"][0])
-
-    elif config.get("session_names"):
-
-        await state.update_data(search_account=config["session_names"][0])
-
-    await callback.message.edit_text(
-
-        "🔑 **Глобальный поиск: введите ключевое слово**\n\n"
-
-        "Например: `купить бота`, `ищу фрилансера`, `нужен парсер`\n\n"
-
-        "После слова — выберете аккаунт-поисковик (если их несколько).",
-
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-
-            [InlineKeyboardButton(text="⬅ Назад", callback_data="db_search")]
-
-        ])
-
-    )
-
-
-@dp.callback_query(F.data == "db_search_in_groups")
-
-async def cb_db_search_in_groups(callback: CallbackQuery, state: FSMContext):
-
-    user_id = callback.from_user.id
-
-    config = await load_config(user_id)
-
-    await state.set_state(BotStates.waiting_for_search_keyword)
-
-    await state.update_data(search_mode="in_groups")
-
-    if config.get("session_names"):
-
-        await state.update_data(search_account=config["session_names"][0])
-
-    await callback.message.edit_text(
-
-        "🔑 **Поиск по списку чатов: введите ключевое слово**\n\n"
-
-        "Например: `купить бота`, `ищу фрилансера`, `нужен парсер`\n\n"
-
-        "После слова — спрошу список чатов для поиска.",
-
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-
-            [InlineKeyboardButton(text="⬅ Назад", callback_data="db_search")]
-
-        ])
-
-    )
-
-
-@dp.message(BotStates.waiting_for_search_keyword)
-
-async def process_search_keyword(message: Message, state: FSMContext):
-
-    user_id = message.from_user.id
-
-    data = await state.get_data()
-
-    mode = data.get("search_mode")
-
-    account_name = data.get("search_account")
-
-    keyword = (message.text or "").strip()
-
-
-    if not keyword:
-
-        await message.answer("❌ Пустое слово. Пришлите ключевое слово.")
-
-        return
-
-    if len(keyword) < 2:
-
-        await message.answer("❌ Слишком короткое. Минимум 2 символа.")
-
-        return
-
-
-    config = await load_config(user_id)
-
-
-    # Если несколько аккаунтов — спросим какой использовать
-
-    if len(config.get("session_names", [])) > 1 and not message.text.startswith("/"):
-
-        buttons = [[InlineKeyboardButton(text=a, callback_data=f"db_sacc_{mode}_{a}")] for a in config["session_names"]]
-
-        # Сохраним в state keyword и пойдём в инлайн-обработчик
-
-        await state.update_data(search_keyword=keyword)
-
-        await message.answer(
-
-            f"🔑 Слово: `{keyword}`\n\n👤 Выберите аккаунт-поисковик:",
-
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+            (user_id,)
 
         )
 
-        return
+        rows = await cur.fetchall()
 
-
-    # Один аккаунт — идём дальше
-
-    if mode == "global":
-
-        status_msg = await message.answer(
-
-            f"⏳ Запускаю глобальный поиск по слову `{keyword}` с аккаунта **{account_name}**…"
-
-        )
-
-        task = asyncio.create_task(search_global(message.bot, user_id, keyword, account_name, status_msg))
-
-        active_searches[user_id] = task
-
-        await state.clear()
-
-    else:  # in_groups
-
-        await state.update_data(search_keyword=keyword)
-
-        await state.set_state(BotStates.waiting_for_search_groups)
-
-        await message.answer(
-
-            f"🔑 Слово: `{keyword}`\n\n"
-
-            f"📝 Теперь отправьте список чатов для поиска (по одному на строку):\n"
-
-            f"• @username\n"
-
-            f"• https://t.me/username\n"
-
-            f"• -100xxxxxxxxxx (id)\n\n"
-
-            f"💡 Аккаунт-поисковик должен быть участником этих чатов.",
-
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-
-                [InlineKeyboardButton(text="⬅ Назад", callback_data="db_search")]
-
-            ])
-
-        )
-
-
-@dp.callback_query(F.data.startswith("db_sacc_"))
-
-async def cb_db_search_acc_choose(callback: CallbackQuery, state: FSMContext):
-
-    # db_sacc_<mode>_<acc_name>
-
-    rest = callback.data.replace("db_sacc_", "", 1)
-
-    # rest = "global_session_name" или "in_groups_session_name"
-
-    if rest.startswith("global_"):
-
-        mode = "global"
-
-        account_name = rest[len("global_"):]
-
-    elif rest.startswith("in_groups_"):
-
-        mode = "in_groups"
-
-        account_name = rest[len("in_groups_"):]
-
-    else:
-
-        await callback.answer("❌ Ошибка выбора.", show_alert=True)
-
-        return
-
-
-    data = await state.get_data()
-
-    keyword = data.get("search_keyword")
-
-    user_id = callback.from_user.id
-
-
-    if not keyword:
-
-        await state.clear()
-
-        await callback.message.edit_text("❌ Ключевое слово потеряно, начните заново.", reply_markup=get_db_keyboard())
-
-        return
-
-
-    if mode == "global":
-
-        status_msg = await callback.message.edit_text(
-
-            f"⏳ Запускаю глобальный поиск по `{keyword}` с **{account_name}**…"
-
-        )
-
-        task = asyncio.create_task(search_global(callback.message.bot, user_id, keyword, account_name, status_msg))
-
-        active_searches[user_id] = task
-
-        await state.clear()
-
-    else:
-
-        await state.update_data(search_account=account_name, search_keyword=keyword)
-
-        await state.set_state(BotStates.waiting_for_search_groups)
+    if not rows:
 
         await callback.message.edit_text(
 
-            f"🔑 Слово: `{keyword}`\n"
+            "📋 **Список пуст.**\n\nДобавьте пользователей кнопкой «➕ Добавить пользователей».",
 
-            f"👤 Аккаунт: **{account_name}**\n\n"
-
-            f"📝 Отправьте список чатов для поиска (по одному на строку):\n"
-
-            f"• @username\n"
-
-            f"• https://t.me/username\n"
-
-            f"• -100xxxxxxxxxx (id)",
-
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-
-                [InlineKeyboardButton(text="⬅ Назад", callback_data="db_search")]
-
-            ])
+            reply_markup=get_db_keyboard()
 
         )
 
-
-@dp.message(BotStates.waiting_for_search_groups)
-
-async def process_search_groups(message: Message, state: FSMContext):
-
-    user_id = message.from_user.id
-
-    data = await state.get_data()
-
-    keyword = data.get("search_keyword")
-
-    account_name = data.get("search_account")
-
-    if not keyword or not account_name:
-
-        await state.clear()
-
-        await message.answer("❌ Контекст потерян, начните заново через ‘Поиск по слову’.")
-
         return
 
+    lines = []
 
-    raw = [line.strip() for line in (message.text or "").split("\n") if line.strip()]
+    for tg_id, uname, fname, disp, archived in rows:
 
-    groups = []
+        if archived:
 
-    for line in raw:
+            mark = "🗂"
 
-        if "t.me/" in line:
+        else:
 
-            line = "@" + line.split("t.me/")[-1].replace("/", "").replace("+", "")
+            mark = "✅"
 
-        groups.append(line)
+        name = disp or fname or (f"@{uname}" if uname else "—")
 
-    if not groups:
+        uname_part = f" (@{uname})" if uname and disp else (f" (@{uname})" if uname else "")
 
-        await message.answer("❌ Пустой список. Пришлите хотя бы один чат.")
+        lines.append(f"{mark} {name}{uname_part}  `id:{tg_id}`")
 
-        return
+    text = "📋 **Список получателей (последние 200):**\n\n" + "\n".join(lines)
+
+    kb_rows = [[InlineKeyboardButton(text="🗑 Удалить по id", callback_data="db_delete_prompt")]]
+
+    kb_rows.append([InlineKeyboardButton(text="⬅ Назад", callback_data="db_menu")])
+
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
 
-    status_msg = await message.answer(
+@dp.callback_query(F.data == "db_delete_prompt")
 
-        f"⏳ Запускаю поиск `{keyword}` по {len(groups)} чатам с **{account_name}**…"
+async def cb_db_delete_prompt(callback: CallbackQuery, state: FSMContext):
+
+    await state.set_state(BotStates.waiting_for_add_users)  # переиспользуем стейт для ввода
+
+    await state.update_data(delete_mode=True)
+
+    await callback.message.edit_text(
+
+        "🗑 **Удаление по id**\n\n"
+
+        "Отправьте Telegram `user_id` (число) или несколько id через пробел/с новой строки — "
+
+        "эти юзеры будут удалены из вашей базы.\n\n"
+
+        "💡 Id можно посмотреть в ‘📋 Список’ — в конце строки `id:xxxx`.",
+
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+
+            [InlineKeyboardButton(text="⬅ Назад", callback_data="db_list_users")]
+
+        ])
 
     )
 
-    task = asyncio.create_task(search_in_groups(message.bot, user_id, keyword, groups, account_name, status_msg))
 
-    active_searches[user_id] = task
+@dp.callback_query(F.data == "db_add_users")
 
-    await state.clear()
-
-
-@dp.callback_query(F.data == "db_parse")
-
-async def cb_db_parse(callback: CallbackQuery):
+async def cb_db_add_users(callback: CallbackQuery, state: FSMContext):
 
     user_id = callback.from_user.id
 
@@ -2742,54 +1513,55 @@ async def cb_db_parse(callback: CallbackQuery):
 
         return
 
-    if len(config["session_names"]) == 1:
+    await state.set_state(BotStates.waiting_for_add_users)
 
-        # Один аккаунт — сразу просим группы
+    await state.update_data(delete_mode=False)
 
-        acc = config["session_names"][0]
+    account_name = config["session_names"][0]
 
-        await state_dispatch_parse(callback.message, user_id, acc)
+    if len(config["session_names"]) > 1:
+
+        kb = [[InlineKeyboardButton(text=a, callback_data=f"add_acc_{a}")] for a in config["session_names"]]
+
+        kb.append([InlineKeyboardButton(text="⬅ Назад", callback_data="db_menu")])
+
+        await callback.message.edit_text(
+
+            "👤 **Выберите аккаунт** для резолва username → user_id:",
+
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+
+        )
 
         return
 
-    # Несколько — спросим какой использовать для парсинга
-
-    buttons = [[InlineKeyboardButton(text=a, callback_data=f"db_parse_acc_{a}")] for a in config["session_names"]]
-
-    buttons.append([InlineKeyboardButton(text="⬅ Назад", callback_data="db_menu")])
+    await state.update_data(add_account=account_name)
 
     await callback.message.edit_text(
 
-        "👥 **Парсер: выберите аккаунт-парсер**\n\n"
+        f"👤 Аккаунт-резолвер: **{account_name}**\n\n"
 
-        "С этого аккаунта будут читаться участники групп.",
+        f"➕ **Добавление пользователей в базу**\n\n"
 
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+        f"Отправьте список, по одному на строку:\n\n"
 
-    )
+        f"**Формат:**\n"
 
+        f"• `@username Имя Фамилия` — добавить с именем (плейсхолдер `{{user}}` подставит это имя)\n"
 
-async def state_dispatch_parse(message, user_id, account_name):
+        f"• `@username` — без имени (подставится имя из Telegram)\n\n"
 
-    state = dp.fsm.get_context(bot=message.bot, chat_id=user_id, user_id=user_id)
+        f"**Пример:**\n"
 
-    await state.set_state(BotStates.waiting_for_parse_groups)
+        f"`@marina_petrova Марина`\n"
 
-    await state.update_data(parse_account=account_name)
+        f"`@ivan_ivanov Иван Иванов`\n"
 
-    await message.answer(
+        f"`@someone`\n\n"
 
-        f"👥 **Аккаунт-парсер:** {account_name}\n\n"
+        f"💡 Бот проверит, что username существует, и сохранит в базу.\n"
 
-        f"📝 Отправьте список групп (по одной на строку):\n"
-
-        f"• @username\n"
-
-        f"• https://t.me/username\n"
-
-        f"• -100xxxxxxxxxx (id)\n\n"
-
-        f"⏳ Большие группы = дольше + риск FloodWait. Лучше 5–10 штук за раз.",
+        f"🔁 Повторное добавление того же юзера обновит его имя и снимет с архива.",
 
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
 
@@ -2800,59 +1572,179 @@ async def state_dispatch_parse(message, user_id, account_name):
     )
 
 
-@dp.callback_query(F.data.startswith("db_parse_acc_"))
+@dp.callback_query(F.data.startswith("add_acc_"))
 
-async def cb_db_parse_acc_choose(callback: CallbackQuery, state: FSMContext):
+async def cb_db_add_acc_choose(callback: CallbackQuery, state: FSMContext):
 
-    acc = callback.data.replace("db_parse_acc_", "")
+    acc = callback.data.replace("add_acc_", "")
 
-    await state_dispatch_parse(callback.message, callback.from_user.id, acc)
+    await state.set_state(BotStates.waiting_for_add_users)
+
+    await state.update_data(delete_mode=False, add_account=acc)
+
+    await callback.message.edit_text(
+
+        f"👤 Аккаунт-резолвер: **{acc}**\n\n"
+
+        f"➕ **Добавление пользователей в базу**\n\n"
+
+        f"Отправьте список, по одному на строку:\n\n"
+
+        f"**Формат:**\n"
+
+        f"• `@username Имя` — добавить с именем для `{{user}}`\n"
+
+        f"• `@username` — без имени\n\n"
+
+        f"**Пример:**\n"
+
+        f"`@marina_petrova Марина`\n"
+
+        f"`@ivan_ivanov Иван`\n\n"
+
+        f"💡 Бот проверит, что username существует, и сохранит в базу.",
+
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+
+            [InlineKeyboardButton(text="⬅ Назад", callback_data="db_menu")]
+
+        ])
+
+    )
 
 
-@dp.message(BotStates.waiting_for_parse_groups)
+@dp.message(BotStates.waiting_for_add_users)
 
-async def process_parse_groups(message: Message, state: FSMContext):
+async def process_add_or_delete(message: Message, state: FSMContext):
 
     user_id = message.from_user.id
 
     data = await state.get_data()
 
-    account_name = data.get("parse_account")
+    if data.get("delete_mode"):
 
+        ids_raw = [tok.strip() for tok in (message.text or "").replace(",", " ").split() if tok.strip()]
 
-    raw = [line.strip() for line in (message.text or "").split("\n") if line.strip()]
+        ids = [int(t) for t in ids_raw if t.lstrip("-").isdigit()]
 
-    groups = []
+        ids = list(set(ids))
 
-    for line in raw:
+        if not ids:
 
-        if "t.me/" in line:
+            await message.answer("❌ Не нашёл id. Пришлите числа.")
 
-            line = "@" + line.split("t.me/")[-1].replace("/", "").replace("+", "")
+            return
 
-        groups.append(line)
+        placeholders = ",".join("?" * len(ids))
 
+        async with aiosqlite.connect(DB_PATH) as db:
 
-    if not groups:
+            cur = await db.execute(
 
-        await message.answer("❌ Пустой список. Пришлите хотя бы одну группу.")
+                f"DELETE FROM parsed_users WHERE owner_id=? AND user_id IN ({placeholders})",
+
+                (user_id, *ids)
+
+            )
+
+            deleted = cur.rowcount or 0
+
+            await db.commit()
+
+        await state.clear()
+
+        await message.answer(
+
+            f"🗑 Удалено из базы: **{deleted}** из {len(ids)}.",
+
+            reply_markup=get_db_keyboard()
+
+        )
 
         return
+
+
+    config = await load_config(user_id)
+
+    account_name = data.get("add_account") or (config.get("session_names", [None])[0])
 
     if not account_name:
 
         await state.clear()
 
-        await message.answer("❌ Не выбран аккаунт. Начните заново через ‘Парсер / База’.")
+        await message.answer("❌ Нет активного аккаунта. Сначала добавьте его в ‘Аккаунты / Сессии’.")
 
         return
 
 
-    status_msg = await message.answer(f"⏳ Готовлю парсинг: {len(groups)} групп, аккаунт **{account_name}**…")
+    lines = [l.strip() for l in (message.text or "").split("\n") if l.strip()]
 
-    task = asyncio.create_task(parse_users_from_groups(message.bot, user_id, groups, account_name, status_msg))
+    if not lines:
 
-    active_parsers[user_id] = task
+        await message.answer("❌ Пустой список. Пришлите хотя бы одну строку.")
+
+        return
+
+
+    status_msg = await message.answer(f"⏳ Обрабатываю {len(lines)} строк через **{account_name}**…")
+
+    success_msgs = []
+
+    failed_msgs = []
+
+    added = 0
+
+    for line in lines:
+
+        parsed = parse_user_line(line)
+
+        if not parsed:
+
+            failed_msgs.append(f"❌ {line[:60]} — невалидный формат (ожидаю `@username Имя`)")
+
+            continue
+
+        username, display_name = parsed
+
+        ok, msg = await resolve_and_add_user(user_id, username, display_name, account_name)
+
+        if ok:
+
+            added += 1
+
+            success_msgs.append(msg)
+
+        else:
+
+            failed_msgs.append(msg)
+
+    success_text = "\n".join(success_msgs[:15]) if success_msgs else "—"
+
+    if len(success_msgs) > 15:
+
+        success_text += f"\n… и ещё {len(success_msgs) - 15}"
+
+    fail_text = "\n".join(failed_msgs[:15]) if failed_msgs else "—"
+
+    if len(failed_msgs) > 15:
+
+        fail_text += f"\n… и ещё {len(failed_msgs) - 15}"
+
+    await status_msg.edit_text(
+
+        f"✅ **Добавление завершено!**\n\n"
+
+        f"➕ Успешно: **{added}**\n"
+
+        f"❌ Ошибок: **{len(failed_msgs)}**\n\n"
+
+        f"**Успешно:**\n{success_text}\n\n"
+
+        f"**Ошибки:**\n{fail_text}",
+
+        reply_markup=get_db_keyboard()
+
+    )
 
     await state.clear()
 
@@ -2926,9 +1818,17 @@ async def state_dispatch_db_mailing_text(message, user_id, account_name):
 
         f"💡 Поддерживаются плейсхолдеры:\n"
 
-        f"  • `{{first_name}}` — имя получателя\n"
+        f"  • `{{user}}` — **имя из базы** (то, что вы указали при добавлении)\n"
+
+        f"  • `{{first_name}}` — имя получателя из Telegram\n"
 
         f"  • `{{username}}` — @username или имя\n\n"
+
+        f"**Пример:**\n"
+
+        f"`Здравствуйте {{user}}!`\n"
+
+        f"Подставит: «Здравствуйте Марина!», «Здравствуйте Иван!», и т.д.\n\n"
 
         f"⚠️ **Обратите внимание:** Telegram ограничивает ЛС незнакомым юзерам. "
 
@@ -2979,19 +1879,6 @@ async def process_db_mailing_text(message: Message, state: FSMContext):
     if not text.strip():
 
         await message.answer("❌ Текст пустой. Пришлите сообщение.")
-
-        return
-
-
-    # Проверка лимита перед стартом
-
-    config = await load_config(user_id)
-
-    if not config["is_premium"] and config["daily_sent"] >= FREE_LIMIT:
-
-        await message.answer("🛑 Дневной лимит уже исчерпан. Купите Премиум.")
-
-        await state.clear()
 
         return
 
@@ -3366,15 +2253,13 @@ async def cb_stats_view(callback: CallbackQuery):
 
     config = await load_config(user_id)
 
-    
+    db_stats = await get_user_db_stats(user_id)
 
-    plan = "⭐ Premium (Бесконечно)" if config["is_premium"] else f"БЕСПЛАТНЫЙ ({config['daily_sent']}/{FREE_LIMIT} писем сегодня)"
-
-    
+    db_state = await get_db_mailing_state(user_id)
 
     text = (f"📊 **Ваша статистика:**\n\n"
 
-            f"• Ваш тариф: **{plan}**\n"
+            f"• Тариф: **Бесплатный (без лимитов)**\n"
 
             f"• Всего отправлено: {config['stats']['sent_count']}\n"
 
@@ -3382,7 +2267,13 @@ async def cb_stats_view(callback: CallbackQuery):
 
             f"• Загружено чатов: {len(config['chats'])}\n"
 
-            f"• Активных аккаунтов: {len(config.get('session_names', []))}")
+            f"• Активных аккаунтов: {len(config.get('session_names', []))}\n\n"
+
+            f"📥 **База получателей:**\n"
+
+            f"• Всего: {db_stats['total']} (активных: {db_stats['active']}, в архиве: {db_stats['archived']})\n"
+
+            f"• Рассылка по базе: **{db_state.get('status', 'stopped')}**")
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅ Назад", callback_data="back_to_menu")]])
 
